@@ -1,0 +1,43 @@
+{
+  "manifest_version": 3,
+  "name": "Twitch Alt Manager",
+  "version": "1.1.0",
+  "description": "Switch between Twitch accounts instantly — no passwords, no 2FA codes.",
+  "permissions": [
+    "cookies",
+    "storage",
+    "tabs",
+    "alarms",
+    "scripting"
+  ],
+  "host_permissions": [
+    "https://www.twitch.tv/*",
+    "https://twitch.tv/*",
+    "https://passport.twitch.tv/*",
+    "https://gql.twitch.tv/*",
+    "https://id.twitch.tv/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://www.twitch.tv/*"],
+      "js": ["content.js"],
+      "run_at": "document_start"
+    }
+  ]
+}
