@@ -81,6 +81,38 @@ twitch-alt-manager/
 
 ---
 
+## Изменения в v1.2.0
+
+Исправлены 16 найденных проблем в коде:
+
+| # | Файл | Проблема | Исправление |
+|---|---|---|---|
+| 1 | background.js | `getAllTwitchCookies` не захватывал cookies с доменом `.twitch.tv` | Запрос по 6 доменам + дедупликация |
+| 2 | background.js | `setCookies` молча игнорировал ошибки | Логирование + отчёт succeeded/failed |
+| 3 | background.js | Имя аккаунта не парсилось из JSON `twilight-user` | `extractUsernameFromTwilightUser()` с JSON.parse |
+| 4 | content.js | Удаление IndexedDB могло зависнуть при занятой базе | `deleteDatabaseSafe()` с onblocked/onerror/таймаутом |
+| 5 | popup.js | `escHtml` не экранировал `'` | Добавлена замена на `&#39;` (и заменено на DOM API) |
+| 6 | manifest.json / background.js | `periodInMinutes: 0.4` — ниже минимума Chrome (1 мин) | Изменено на `1` |
+| 7 | background.js | Не проверялась установка `auth-token` перед перезагрузкой вкладок | Проверка `setReport.succeeded` — при неудаче переключение прерывается |
+| 8 | background.js | `pendingLocalStorage` не чистился при удалении аккаунта | Добавлена очистка в `deleteAccount` |
+| 9 | popup.js | Сравнение по `label`, а не по реальному cookie-логину | `state.currentUser` теперь всегда из cookies |
+| 10 | popup.js | `innerHTML` с непроверенными данными | Полностью переписано на `createElement`/`textContent` |
+| 11 | content.js | `chrome.storage.local.get` без проверки `lastError` | Добавлена проверка `chrome.runtime.lastError` |
+| 12 | background.js | Нет проверки наличия вкладки Twitch | Явная проверка + понятная ошибка |
+| 13 | background.js | Задержка 150мс не гарантировала завершение очистки | `sendMessage` с ожиданием ack + таймаут |
+| 14 | popup.js | Попап закрывался до полного завершения переключения | Закрытие только после `loadState()` |
+| 15 | background.js | `decrypt`/`JSON.parse` без раздельной обработки ошибок | Отдельные try/catch с понятными сообщениями |
+| 16 | content.js / background.js | `pendingLocalStorage` мог примениться к чужому аккаунту | Привязка к `accountId`, проверка перед восстановлением |
+
+**Новая структура `pendingLocalStorage`:**
+```js
+{
+  accountId: "acc_1234567890",
+  data: { "twilight-user": "...", ... },
+  createdAt: 1234567890
+}
+```
+
 ## Вдохновение
 
 Идея взята из мода [In-Game Account Switcher](https://modrinth.com/mod/in-game-account-switcher) для Minecraft — мгновенное переключение аккаунтов без перезапуска.
