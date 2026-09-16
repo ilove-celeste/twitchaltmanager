@@ -65,17 +65,9 @@ function avatarColor(name) {
   return AVATAR_COLORS[Math.abs(h) % AVATAR_COLORS.length];
 }
 
-// FIX #5 (было: escHtml не экранировал одинарные кавычки)
-// Оставлена для обратной совместимости / прочих мест, где используется textContent-safe строка,
-// но теперь она больше не нужна для рендера списка аккаунтов (см. FIX #10 — используем DOM API).
-function escHtml(str) {
-  return String(str)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
-}
+// (escHtml удалена — была мёртвым кодом: renderAccounts использует DOM API
+// (createElement/textContent), который безопасен сам по себе и не нуждается
+// в HTML-экранировании строк)
 
 // Небольшой хелпер для создания SVG-иконок без innerHTML
 function createSvgIcon(pathsData, viewBox = '0 0 24 24') {
@@ -264,8 +256,9 @@ async function switchAccount(accountId, username) {
 
     showToast(`Переключено: ${username}`, 'success');
 
-    // Закрываем попап только после полного успеха переключения и обновления состояния
-    setTimeout(() => window.close(), 800);
+    // FIX #11: задержка увеличена с 800 до 2000мс, чтобы пользователь
+    // гарантированно успел увидеть уведомление об успехе перед закрытием попапа
+    setTimeout(() => window.close(), 2000);
   } catch (e) {
     hideSwitching();
     showToast('Ошибка: ' + e.message, 'error', 4000);
@@ -348,7 +341,14 @@ btnConfirm.addEventListener('click', async () => {
 });
 
 labelInput.addEventListener('keydown', e => {
-  if (e.key === 'Enter') btnConfirm.click();
+  if (e.key === 'Enter') {
+    // FIX #12: preventDefault останавливает возможную нативную отправку формы,
+    // а проверка !btnConfirm.disabled не даёт запустить повторный сабмит,
+    // пока предыдущий запрос captureAccount ещё выполняется (кнопка временно
+    // задизейблена в btnConfirm.addEventListener выше).
+    e.preventDefault();
+    if (!btnConfirm.disabled) btnConfirm.click();
+  }
   if (e.key === 'Escape') addPanel.classList.remove('open');
 });
 

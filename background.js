@@ -1,26 +1,109 @@
 // background.js — Service Worker for Twitch Alt Manager
+//
+// ВАЖНО О БЕЗОПАСНОСТИ (см. README "Модель угроз"):
+// Ключ шифрования хранится как non-extractable CryptoKey в IndexedDB.
+// Это значит, что сами байты ключа НЕЛЬЗЯ прочитать даже кодом расширения —
+// только использовать через crypto.subtle.encrypt/decrypt. Это существенно
+// надёжнее, чем хранить сырые байты ключа в chrome.storage.local (как было
+// раньше), но НЕ является полной защитой: код, выполняющийся в контексте
+// самого расширения (например, при компрометации браузера в целом или через
+// remote debugging), всё ещё может вызвать decrypt(). Абсолютной защиты без
+// участия внешнего секрета (например, мастер-пароля) не существует —
+// это фундаментальное ограничение любого локального хранилища расширений.
 
-// ─── Encryption helpers (AES-GCM via Web Crypto) ─────────────────────────────
+// ─── Хранилище ключа шифрования (IndexedDB, non-extractable CryptoKey) ───────
 
-async function getEncryptionKey() {
+const KEY_DB_NAME     = 'TwitchAltManagerKeyDB';
+const KEY_DB_VERSION  = 1;
+const KEY_STORE_NAME  = 'keys';
+const KEY_RECORD_ID   = 'main';
+
+function openKeyDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(KEY_DB_NAME, KEY_DB_VERSION);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(KEY_STORE_NAME)) {
+        db.createObjectStore(KEY_STORE_NAME);
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+function idbGetKey() {
+  return openKeyDB().then(db => new Promise((resolve, reject) => {
+    const tx = db.transaction(KEY_STORE_NAME, 'readonly');
+    const store = tx.objectStore(KEY_STORE_NAME);
+    const req = store.get(KEY_RECORD_ID);
+    req.onsuccess = () => resolve(req.result || null);
+    req.onerror = () => reject(req.error);
+  }));
+}
+
+function idbSetKey(cryptoKey) {
+  return openKeyDB().then(db => new Promise((resolve, reject) => {
+    const tx = db.transaction(KEY_STORE_NAME, 'readwrite');
+    const store = tx.objectStore(KEY_STORE_NAME);
+    const req = store.put(cryptoKey, KEY_RECORD_ID);
+    req.onsuccess = () => resolve();
+    req.onerror = () => reject(req.error);
+  }));
+}
+
+// FIX #1: миграция со старой схемы (сырые байты ключа в chrome.storage.local)
+// на новую (non-extractable CryptoKey в IndexedDB). Импортируем старые байты
+// как non-extractable ключ — это НЕ теряет доступ к уже сохранённым аккаунтам
+// (ключ математически тот же), но после этого сырые байты удаляются из
+// chrome.storage.local и больше нигде не хранятся в читаемом виде.
+async function migrateLegacyKeyIfNeeded() {
   const stored = await chrome.storage.local.get('_enc_key');
-  if (stored._enc_key) {
-    return await crypto.subtle.importKey(
-      'raw',
-      new Uint8Array(stored._enc_key),
-      { name: 'AES-GCM' },
-      false,
-      ['encrypt', 'decrypt']
-    );
-  }
-  const key = await crypto.subtle.generateKey(
-    { name: 'AES-GCM', length: 256 },
-    true,
+  if (!stored._enc_key) return null;
+
+  const nonExtractableKey = await crypto.subtle.importKey(
+    'raw',
+    new Uint8Array(stored._enc_key),
+    { name: 'AES-GCM' },
+    false, // non-extractable — с этого момента байты ключа нельзя достать обратно
     ['encrypt', 'decrypt']
   );
-  const exported = await crypto.subtle.exportKey('raw', key);
-  await chrome.storage.local.set({ _enc_key: Array.from(new Uint8Array(exported)) });
-  return key;
+
+  await idbSetKey(nonExtractableKey);
+  await chrome.storage.local.remove('_enc_key');
+  console.info('[Twitch Alt Manager] Ключ шифрования мигрирован в защищённое хранилище (non-extractable, IndexedDB). Старые аккаунты остаются доступны.');
+  return nonExtractableKey;
+}
+
+// Кэш промиса ключа в памяти service worker (сбрасывается при рестарте SW —
+// это нормально, следующий вызов просто заново прочитает ключ из IndexedDB).
+let cachedKeyPromise = null;
+
+async function getEncryptionKey() {
+  if (cachedKeyPromise) return cachedKeyPromise;
+
+  cachedKeyPromise = (async () => {
+    let key = await idbGetKey();
+    if (key) return key;
+
+    key = await migrateLegacyKeyIfNeeded();
+    if (key) return key;
+
+    // Ключа нигде нет — создаём новый non-extractable ключ
+    const newKey = await crypto.subtle.generateKey(
+      { name: 'AES-GCM', length: 256 },
+      false, // non-extractable
+      ['encrypt', 'decrypt']
+    );
+    await idbSetKey(newKey);
+    return newKey;
+  })();
+
+  // Если инициализация ключа провалилась — не кэшируем провалившийся промис,
+  // иначе все последующие вызовы будут падать даже после устранения причины.
+  cachedKeyPromise.catch(() => { cachedKeyPromise = null; });
+
+  return cachedKeyPromise;
 }
 
 async function encrypt(text) {
@@ -44,9 +127,7 @@ async function decrypt(encObj) {
 
 // ─── Cookie helpers ───────────────────────────────────────────────────────────
 
-// FIX #1 (было: domain: 'twitch.tv' — не захватывал cookies с доменом .twitch.tv)
-// Делаем несколько запросов по разным доменам и объединяем результат, убирая дубликаты
-// по паре (name, domain, path), чтобы гарантированно получить все cookies Twitch.
+// Запрашиваем cookies по нескольким доменам Twitch и объединяем без дублей.
 async function getAllTwitchCookies() {
   const domainsToQuery = [
     '.twitch.tv',
@@ -72,10 +153,16 @@ async function getAllTwitchCookies() {
   return Array.from(merged.values());
 }
 
+// Разобрано и подтверждено корректным (пункт "5" из списка проблем не является
+// багом): если домен начинается с точки — используем www.<домен без точки>
+// (Twitch редиректит apex-домен на www); для остальных доменов (id., passport.,
+// gql. и т.д.) используем домен как есть, без модификаций.
 function cookieUrl(c) {
-  const domain = c.domain.startsWith('.') ? c.domain.substring(1) : c.domain;
-  const host = c.domain.startsWith('.') ? `www.${domain}` : domain;
-  return `https://${host}${c.path || '/'}`;
+  if (c.domain.startsWith('.')) {
+    const domainWithoutDot = c.domain.substring(1);
+    return `https://www.${domainWithoutDot}${c.path || '/'}`;
+  }
+  return `https://${c.domain}${c.path || '/'}`;
 }
 
 async function clearTwitchCookies() {
@@ -88,17 +175,39 @@ async function clearTwitchCookies() {
   return { removed: cookies.length - failed.length, failed: failed.length };
 }
 
-// FIX #2 (было: ошибки установки cookies молча игнорировались)
-// Теперь собираем результат каждой установки (успех/причина ошибки) и логируем,
-// чтобы можно было понять, какие именно cookies не установились.
+// FIX #4: продление срока действия cookies было некорректным — раньше ЛЮБОЙ
+// cookie (даже уже истёкший) продлевался минимум на 30 дней вперёд. Теперь:
+//   - сессионные cookies (без expirationDate) остаются сессионными;
+//   - уже истёкшие (expirationDate <= now) НЕ продлеваются — оставляем как есть
+//     (такой cookie не имеет смысла "оживлять" локально: сервер Twitch всё
+//     равно будет ориентироваться на собственную валидность сессии, а
+//     искусственное продление создаёт ложное ощущение рабочей сессии);
+//   - валидные cookies с оставшимся сроком МЕНЬШЕ 30 дней — продлеваем до 30 дней;
+//   - валидные cookies с оставшимся сроком БОЛЬШЕ 30 дней — оставляем как есть.
+function computeExpirationDate(originalExpirationDate) {
+  if (!originalExpirationDate) return undefined; // сессионный cookie — не трогаем
+
+  const now = Date.now() / 1000;
+  const thirtyDaysFromNow = now + 60 * 60 * 24 * 30;
+
+  if (originalExpirationDate <= now) {
+    // Уже истёк — не продлеваем искусственно
+    return originalExpirationDate;
+  }
+  if (originalExpirationDate < thirtyDaysFromNow) {
+    // Валиден, но срок короче 30 дней — продлеваем
+    return thirtyDaysFromNow;
+  }
+  // Валиден и уже дольше 30 дней — оставляем оригинальный срок
+  return originalExpirationDate;
+}
+
 async function setCookies(cookieList) {
   const report = { succeeded: [], failed: [] };
 
   for (const c of cookieList) {
     try {
-      const domain = c.domain || '.twitch.tv';
-      const host = domain.startsWith('.') ? `www${domain}` : domain;
-      const url = `https://${host}${c.path || '/'}`;
+      const url = cookieUrl(c);
       const details = {
         url,
         name: c.name,
@@ -109,15 +218,17 @@ async function setCookies(cookieList) {
         httpOnly: c.httpOnly || false,
         sameSite: c.sameSite || 'no_restriction'
       };
-      if (c.expirationDate) {
-        // Продлеваем срок действия до 30 дней от текущего момента, если он раньше
-        details.expirationDate = Math.max(c.expirationDate, Date.now() / 1000 + 60 * 60 * 24 * 30);
+
+      const expirationDate = computeExpirationDate(c.expirationDate);
+      if (expirationDate !== undefined) {
+        details.expirationDate = expirationDate;
       }
+      // Если expirationDate === undefined — намеренно НЕ добавляем поле,
+      // cookie останется сессионным (как и был изначально).
 
       const result = await chrome.cookies.set(details);
 
       if (result === null) {
-        // chrome.cookies.set возвращает null при неудаче (например, домен заблокирован)
         const reason = chrome.runtime.lastError ? chrome.runtime.lastError.message : 'unknown reason (cookies.set returned null)';
         console.warn(`[Twitch Alt Manager] Не удалось установить cookie "${c.name}" для ${url}: ${reason}`);
         report.failed.push({ name: c.name, domain: c.domain, reason });
@@ -148,65 +259,85 @@ async function saveAccounts(accounts) {
   await chrome.storage.local.set({ accounts });
 }
 
-// FIX #12 (было: не проверялось наличие активной вкладки Twitch)
-// Теперь явно ищем вкладку Twitch, и если её нет — возвращаем понятную ошибку
-// вместо тихого null.
-async function captureLocalStorageFromTab() {
-  const activeInWindow = await chrome.tabs.query({ url: ['*://*.twitch.tv/*'], active: true, currentWindow: true });
-  const anyTwitchTab = activeInWindow.length ? activeInWindow : await chrome.tabs.query({ url: ['*://*.twitch.tv/*'] });
+// FIX #6: раньше при отсутствии активной вкладки Twitch расширение молча
+// брало "любую" открытую вкладку Twitch (даже фоновую/неактивную), что могло
+// привести к сохранению данных не того контекста, который пользователь имел
+// в виду. Теперь требуем строго активную вкладку в текущем окне.
+//
+// FIX #2: теперь захватываем не только localStorage, но и sessionStorage.
+async function captureStorageFromActiveTab() {
+  const activeTabs = await chrome.tabs.query({
+    url: ['*://*.twitch.tv/*'],
+    active: true,
+    currentWindow: true
+  });
 
-  if (!anyTwitchTab.length) {
-    throw new Error('Не найдена открытая вкладка Twitch. Открой twitch.tv в браузере и повтори.');
+  if (!activeTabs.length) {
+    throw new Error(
+      'Открой Twitch (twitch.tv) в АКТИВНОЙ вкладке текущего окна и повтори сохранение. ' +
+      'Фоновые/неактивные вкладки Twitch не используются намеренно, чтобы не захватить не тот контекст.'
+    );
   }
 
-  const tab = anyTwitchTab[0];
+  const tab = activeTabs[0];
 
   try {
     const results = await chrome.scripting.executeScript({
       target: { tabId: tab.id },
       func: () => {
-        const data = {};
-        const sensitiveKeys = ['twilight-user', 'login', 'auth-token', 'persistent', 'api_token', 'server_session_id'];
-        for (const key of sensitiveKeys) {
-          const val = localStorage.getItem(key);
-          if (val) data[key] = val;
-        }
-        for (let i = 0; i < localStorage.length; i++) {
-          const key = localStorage.key(i);
-          if (key && ['auth', 'token', 'session', 'login', 'persist'].some(p => key.toLowerCase().includes(p))) {
-            data[key] = localStorage.getItem(key);
+        const collect = (storage) => {
+          const data = {};
+          const sensitiveKeys = ['twilight-user', 'login', 'auth-token', 'persistent', 'api_token', 'server_session_id'];
+          for (const key of sensitiveKeys) {
+            const val = storage.getItem(key);
+            if (val) data[key] = val;
           }
-        }
-        return data;
+          for (let i = 0; i < storage.length; i++) {
+            const key = storage.key(i);
+            if (key && ['auth', 'token', 'session', 'login', 'persist'].some(p => key.toLowerCase().includes(p))) {
+              data[key] = storage.getItem(key);
+            }
+          }
+          return data;
+        };
+        return {
+          localStorageData: collect(localStorage),
+          sessionStorageData: collect(sessionStorage)
+        };
       }
     });
-    return results?.[0]?.result || {};
+    return results?.[0]?.result || { localStorageData: {}, sessionStorageData: {} };
   } catch (e) {
-    throw new Error(`Не удалось прочитать localStorage вкладки Twitch: ${e.message}`);
+    throw new Error(`Не удалось прочитать localStorage/sessionStorage вкладки Twitch: ${e.message}`);
   }
 }
 
-// FIX #3 (было: 'twilight-user' не парсился как JSON, извлекалось сырое значение)
-// 'twilight-user' cookie/localStorage значение — это URL-encoded JSON вида
-// {"authToken":"...","displayName":"...","id":"...","login":"..."}.
-// Теперь пытаемся распарсить JSON и достать displayName, а если не получилось — login.
+// FIX #7: раньше при неудачном JSON.parse возвращалось "декодированное" сырое
+// значение вместо null — это могло привести к сохранению мусорной строки как
+// имени пользователя. Теперь при неудаче парсинга JSON возвращаем null.
 function extractUsernameFromTwilightUser(rawValue) {
   if (!rawValue) return null;
   let decoded = rawValue;
-  try { decoded = decodeURIComponent(rawValue); } catch (_) { /* уже decoded или не нужно */ }
+  try { decoded = decodeURIComponent(rawValue); } catch (_) { /* уже decoded */ }
 
   try {
     const parsed = JSON.parse(decoded);
     if (parsed && typeof parsed === 'object') {
       return parsed.displayName || parsed.login || null;
     }
+    return null;
   } catch (_) {
-    // Не JSON — возможно это просто логин строкой (старый формат cookie 'login')
-    return decoded;
+    // Не валидный JSON — раньше здесь возвращалось "decoded" (сырая строка),
+    // теперь явно null, т.к. современный формат 'twilight-user' — это JSON,
+    // и невозможность его распарсить означает, что доверять значению нельзя.
+    return null;
   }
-  return null;
 }
 
+// FIX #7/#8: раньше при неудаче автоопределения имени подставлялся
+// `Account ${Date.now()}` — это создавало бессмысленные, неотличимые друг от
+// друга записи. Теперь в таком случае бросаем понятную ошибку с просьбой
+// указать имя вручную (поле label в попапе).
 async function captureCurrentAccount(label) {
   const cookies = await getAllTwitchCookies();
   if (!cookies.length) throw new Error('No Twitch cookies found. Are you logged in?');
@@ -214,7 +345,6 @@ async function captureCurrentAccount(label) {
   const authToken = cookies.find(c => c.name === 'auth-token');
   if (!authToken) throw new Error('auth-token not found. Make sure you are fully logged in to Twitch.');
 
-  // Определяем имя пользователя: приоритет — явный label, затем twilight-user (JSON), затем login cookie
   let username = label && label.trim() ? label.trim() : null;
 
   if (!username) {
@@ -229,22 +359,19 @@ async function captureCurrentAccount(label) {
       try { username = decodeURIComponent(loginCookie.value); } catch (_) { username = loginCookie.value; }
     }
   }
-  if (!username) username = `Account ${Date.now()}`;
-
-  // Захватываем localStorage (может бросить исключение — пробрасываем понятную ошибку выше)
-  let localStorageData = null;
-  try {
-    localStorageData = await captureLocalStorageFromTab();
-  } catch (e) {
-    // Не фатально для самого сохранения cookies, но сообщаем пользователю через console
-    console.warn('[Twitch Alt Manager]', e.message);
+  if (!username) {
+    throw new Error(
+      'Не удалось автоматически определить имя пользователя из cookies. ' +
+      'Укажи имя аккаунта вручную в поле «Имя аккаунта» и повтори сохранение.'
+    );
   }
 
-  // FIX #15 (было: decrypt/JSON.parse без отдельной обработки ошибок — актуально для switchToAccount,
-  // здесь аналогично оборачиваем encrypt в try/catch с информативным сообщением)
+  // FIX #6/#2: строго активная вкладка, localStorage + sessionStorage
+  const { localStorageData, sessionStorageData } = await captureStorageFromActiveTab();
+
   let encrypted;
   try {
-    const payload = JSON.stringify({ cookies, localStorageData });
+    const payload = JSON.stringify({ cookies, localStorageData, sessionStorageData });
     encrypted = await encrypt(payload);
   } catch (e) {
     throw new Error(`Не удалось зашифровать данные аккаунта: ${e.message}`);
@@ -258,6 +385,7 @@ async function captureCurrentAccount(label) {
     capturedAt: Date.now(),
     cookieCount: cookies.length,
     hasLocalStorage: !!localStorageData && Object.keys(localStorageData).length > 0,
+    hasSessionStorage: !!sessionStorageData && Object.keys(sessionStorageData).length > 0,
     encryptedCookies: encrypted
   };
 
@@ -271,9 +399,6 @@ async function captureCurrentAccount(label) {
   return account;
 }
 
-// FIX #13 (было: фиксированная задержка 150мс не гарантировала завершение очистки)
-// Теперь ждём подтверждения (ok:true) от каждой вкладки через sendMessage с таймаутом,
-// вместо угадывания задержки.
 async function sendToAllTwitchTabsAndWait(msg, timeoutMs = 2000) {
   const tabs = await chrome.tabs.query({ url: ['*://*.twitch.tv/*'] });
   if (!tabs.length) return { tabs: [], acked: 0 };
@@ -292,16 +417,19 @@ async function sendToAllTwitchTabsAndWait(msg, timeoutMs = 2000) {
   return { tabs, acked, results };
 }
 
-// FIX #7 (было: не проверялась успешность установки критичных cookies перед перезагрузкой)
-// FIX #13 (синхронизация через sendMessage вместо фиксированной задержки)
-// FIX #15 (отдельная обработка ошибок decrypt/JSON.parse с информативным сообщением)
-// FIX #16 (pendingLocalStorage теперь привязан к id аккаунта, а не безусловный)
+// FIX #3: список "критичных" cookies, БЕЗ которых сессия точно не будет
+// работать. Проверяем динамически: только те критичные имена, которые
+// реально присутствовали в исходном сохранённом наборе (некоторые аккаунты
+// могут не иметь, например, api_token — тогда его отсутствие не считается
+// ошибкой).
+const CRITICAL_COOKIE_NAMES = ['auth-token', 'twilight-user', 'login', 'persistent', 'api_token', 'server_session_id'];
+
 async function switchToAccount(accountId) {
   const accounts = await loadAccounts();
   const account = accounts.find(a => a.id === accountId);
   if (!account) throw new Error('Account not found');
 
-  // FIX #15: отдельная обработка ошибок расшифровки и парсинга
+  // FIX: отдельная обработка ошибок decrypt и JSON.parse с информативными сообщениями
   let payload;
   try {
     const payloadJson = await decrypt(account.encryptedCookies);
@@ -317,13 +445,13 @@ async function switchToAccount(accountId) {
 
   const cookies = Array.isArray(payload) ? payload : payload.cookies;
   const localStorageData = Array.isArray(payload) ? null : payload.localStorageData;
+  const sessionStorageData = Array.isArray(payload) ? null : payload.sessionStorageData;
 
   if (!cookies || !cookies.length) {
     throw new Error('В сохранённом аккаунте нет cookies. Пересохрани аккаунт.');
   }
 
-  // Шаг 1: очистка localStorage/sessionStorage/IndexedDB во всех вкладках Twitch,
-  // с ожиданием подтверждения от content script (вместо фиксированной задержки)
+  // Шаг 1: очистка localStorage/sessionStorage/IndexedDB во всех вкладках Twitch
   await sendToAllTwitchTabsAndWait({ action: 'clearLocalStorage' }, 2000);
 
   // Шаг 2: удаляем текущие cookies
@@ -332,53 +460,61 @@ async function switchToAccount(accountId) {
   // Шаг 3: устанавливаем cookies целевого аккаунта
   const setReport = await setCookies(cookies);
 
-  // FIX #7: проверяем, что критичный auth-token реально установился
-  const authTokenSet = setReport.succeeded.includes('auth-token');
-  if (!authTokenSet) {
-    const failedAuth = setReport.failed.find(f => f.name === 'auth-token');
+  // FIX #3: проверяем ВСЕ критичные cookies, которые реально были в наборе,
+  // а не только auth-token
+  const relevantCritical = CRITICAL_COOKIE_NAMES.filter(name => cookies.some(c => c.name === name));
+  const missingCritical = relevantCritical.filter(name => !setReport.succeeded.includes(name));
+
+  if (missingCritical.length > 0) {
+    const details = missingCritical
+      .map(name => {
+        const f = setReport.failed.find(x => x.name === name);
+        return f ? `${name} (${f.reason})` : name;
+      })
+      .join(', ');
     throw new Error(
-      `Не удалось установить ключевой cookie auth-token` +
-      (failedAuth ? `: ${failedAuth.reason}` : '') +
-      '. Переключение отменено, вкладки НЕ будут перезагружены.'
+      `Не удалось установить критичные cookies: ${details}. ` +
+      'Переключение отменено, вкладки НЕ будут перезагружены.'
     );
   }
 
   // Шаг 4: помечаем аккаунт активным
   await chrome.storage.local.set({ activeAccountId: accountId });
 
-  // FIX #16: pendingLocalStorage теперь хранит accountId, чтобы content script
-  // не восстановил данные чужого аккаунта, если переключение произошло повторно
-  // до того, как предыдущий pending был применён.
-  if (localStorageData && Object.keys(localStorageData).length > 0) {
+  // FIX #2/#16: pendingStorageData содержит и localStorage, и sessionStorage,
+  // привязанные к accountId (чтобы content script не восстановил данные не
+  // того аккаунта при гонке между несколькими быстрыми переключениями).
+  const hasLocal = localStorageData && Object.keys(localStorageData).length > 0;
+  const hasSession = sessionStorageData && Object.keys(sessionStorageData).length > 0;
+
+  if (hasLocal || hasSession) {
     await chrome.storage.local.set({
-      pendingLocalStorage: {
+      pendingStorageData: {
         accountId,
-        data: localStorageData,
+        localStorageData: hasLocal ? localStorageData : {},
+        sessionStorageData: hasSession ? sessionStorageData : {},
         createdAt: Date.now()
       }
     });
   } else {
-    await chrome.storage.local.remove('pendingLocalStorage');
+    await chrome.storage.local.remove('pendingStorageData');
   }
 
   return { account, setReport };
 }
 
-// FIX #8 (было: pendingLocalStorage не очищался при удалении аккаунта)
 async function deleteAccount(accountId) {
   const accounts = await loadAccounts();
   const filtered = accounts.filter(a => a.id !== accountId);
   await saveAccounts(filtered);
 
-  const { activeAccountId, pendingLocalStorage } = await chrome.storage.local.get(['activeAccountId', 'pendingLocalStorage']);
+  const { activeAccountId, pendingStorageData } = await chrome.storage.local.get(['activeAccountId', 'pendingStorageData']);
 
   if (activeAccountId === accountId) {
     await chrome.storage.local.remove('activeAccountId');
   }
-  // Если pendingLocalStorage принадлежит удаляемому аккаунту — тоже чистим,
-  // иначе может "прилипнуть" к следующему совпавшему аккаунту.
-  if (pendingLocalStorage && pendingLocalStorage.accountId === accountId) {
-    await chrome.storage.local.remove('pendingLocalStorage');
+  if (pendingStorageData && pendingStorageData.accountId === accountId) {
+    await chrome.storage.local.remove('pendingStorageData');
   }
 }
 
@@ -395,8 +531,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         }
         case 'switchAccount': {
           const { account, setReport } = await switchToAccount(msg.accountId);
-          // Перезагружаем вкладки ТОЛЬКО если auth-token успешно установлен
-          // (проверка уже выполнена внутри switchToAccount — если дошли сюда, всё ок)
           const tabs = await chrome.tabs.query({ url: ['*://*.twitch.tv/*'] });
           for (const tab of tabs) {
             try { await chrome.tabs.reload(tab.id, { bypassCache: true }); } catch (_) {}
@@ -450,9 +584,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   return true; // async response
 });
 
-// FIX #6 (было: periodInMinutes: 0.4 — Chrome требует минимум 1 минуту, меньшие
-// значения либо игнорируются, либо округляются, что делает alarm ненадёжным)
-chrome.alarms.create('keepAlive', { periodInMinutes: 1 });
-chrome.alarms.onAlarm.addListener(() => {
-  // no-op: само создание alarm поддерживает service worker активным между тиками
-});
+// FIX #13: разрешение "alarms" и периодический keep-alive удалены.
+// В Manifest V3 service worker автоматически просыпается на события
+// (chrome.runtime.onMessage, клик по иконке popup и т.д.), а вызовы chrome.*
+// API (cookies.set, tabs.reload и т.д.) сами по себе продлевают жизнь SW на
+// время выполнения. Наша самая долгая операция (switchToAccount) занимает
+// секунды, а не десятки секунд простоя — искусственный keep-alive через
+// alarms здесь не даёт практической пользы, только лишнее разрешение в
+// manifest.json и лишний тик каждую минуту.
