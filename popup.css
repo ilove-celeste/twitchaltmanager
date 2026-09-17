@@ -330,5 +330,55 @@ body {
 @keyframes spin { to { transform: rotate(360deg); } }
 .switch-label { font-size: 13px; color: var(--sub); }
 
+/* Custom confirm modal (замена нативного confirm()) */
+.confirm-overlay {
+  position: fixed; inset: 0;
+  background: rgba(14,14,16,0.85);
+  display: none;
+  align-items: center;
+  justify-content: center;
+  z-index: 300;
+  padding: 20px;
+}
+.confirm-overlay.show { display: flex; }
+.confirm-box {
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px;
+  max-width: 280px;
+  width: 100%;
+}
+.confirm-message {
+  font-size: 13px;
+  color: var(--text);
+  margin-bottom: 14px;
+  line-height: 1.4;
+}
+.confirm-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+.btn-confirm-cancel, .btn-confirm-ok {
+  border: none;
+  border-radius: 6px;
+  padding: 6px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  font-family: var(--font);
+}
+.btn-confirm-cancel {
+  background: var(--bg3);
+  color: var(--text);
+}
+.btn-confirm-cancel:hover { background: var(--border); }
+.btn-confirm-ok {
+  background: var(--red);
+  color: #fff;
+}
+.btn-confirm-ok:hover { background: #d43f3f; }
+
 /* scrollbar overall */
 html { overflow: hidden; }

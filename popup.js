@@ -10,8 +10,11 @@ const btnConfirm     = document.getElementById('btnConfirmCapture');
 const switchOverlay  = document.getElementById('switchOverlay');
 const switchLabel    = document.getElementById('switchLabel');
 const footerHint     = document.getElementById('footerHint');
+const confirmOverlay = document.getElementById('confirmOverlay');
+const confirmMessage = document.getElementById('confirmMessage');
+const confirmOkBtn   = document.getElementById('confirmOkBtn');
+const confirmCancelBtn = document.getElementById('confirmCancelBtn');
 
-// state.currentUser хранит имя, полученное из cookies (см. FIX #9 ниже)
 let state = { accounts: [], activeAccountId: null, currentUser: null };
 
 // ─── Toast ─────────────────────────────────────────────────────────────────
@@ -33,15 +36,51 @@ function hideSwitching() {
   switchOverlay.classList.remove('show');
 }
 
+// FIX (проблема #10): собственное модальное окно вместо нативного confirm().
+// Дело не в том, что confirm() "блокируется в Service Worker" (он вызывается
+// в popup.js, а не в фоновом сервис-воркере — там confirm() вообще недоступен
+// и не вызывается) — а в том, что нативный диалог визуально выбивается из
+// тёмной темы попапа и в некоторых managed-конфигурациях браузера может быть
+// отключён политикой (JavaScriptDialogsAllowed и подобные enterprise-политики
+// иногда подавляют window.confirm/alert внутри расширений).
+function showConfirm(message) {
+  return new Promise(resolve => {
+    confirmMessage.textContent = message; // textContent — без HTML-инъекций
+    confirmOverlay.classList.add('show');
+
+    const cleanup = (result) => {
+      confirmOverlay.classList.remove('show');
+      confirmOkBtn.removeEventListener('click', onOk);
+      confirmCancelBtn.removeEventListener('click', onCancel);
+      resolve(result);
+    };
+    const onOk = () => cleanup(true);
+    const onCancel = () => cleanup(false);
+
+    confirmOkBtn.addEventListener('click', onOk);
+    confirmCancelBtn.addEventListener('click', onCancel);
+  });
+}
+
 // ─── Message to background ─────────────────────────────────────────────────
 
+// FIX (проблема #6): технически это уже было безопасно и без явного try/catch —
+// синхронный throw внутри исполнителя `new Promise((resolve, reject) => {...})`
+// автоматически превращается в reject самим движком JS (это встроенное
+// поведение конструктора Promise, а не что-то, что нужно писать вручную).
+// Явный try/catch добавлен ниже для ясности и как страховка на случай
+// будущих изменений кода, а не потому что раньше был реальный баг.
 function sendMsg(msg) {
   return new Promise((resolve, reject) => {
-    chrome.runtime.sendMessage(msg, resp => {
-      if (chrome.runtime.lastError) return reject(new Error(chrome.runtime.lastError.message));
-      if (!resp || !resp.ok) return reject(new Error(resp?.error || 'Unknown error'));
-      resolve(resp);
-    });
+    try {
+      chrome.runtime.sendMessage(msg, resp => {
+        if (chrome.runtime.lastError) return reject(new Error(chrome.runtime.lastError.message));
+        if (!resp || !resp.ok) return reject(new Error(resp?.error || 'Unknown error'));
+        resolve(resp);
+      });
+    } catch (e) {
+      reject(new Error(`Не удалось отправить сообщение расширению: ${e.message}. Попробуй переоткрыть попап.`));
+    }
   });
 }
 
@@ -65,11 +104,6 @@ function avatarColor(name) {
   return AVATAR_COLORS[Math.abs(h) % AVATAR_COLORS.length];
 }
 
-// (escHtml удалена — была мёртвым кодом: renderAccounts использует DOM API
-// (createElement/textContent), который безопасен сам по себе и не нуждается
-// в HTML-экранировании строк)
-
-// Небольшой хелпер для создания SVG-иконок без innerHTML
 function createSvgIcon(pathsData, viewBox = '0 0 24 24') {
   const svgNS = 'http://www.w3.org/2000/svg';
   const svg = document.createElementNS(svgNS, 'svg');
@@ -104,11 +138,8 @@ function deleteIconSvg() {
   ]);
 }
 
-// FIX #10 (было: renderAccounts использовал innerHTML с непроверенными данными —
-// потенциальный вектор для HTML/script-инъекции через имя аккаунта).
-// Теперь весь DOM строится через document.createElement/textContent, без innerHTML.
 function renderAccounts() {
-  accountsList.textContent = ''; // safe clear
+  accountsList.textContent = '';
 
   if (!state.accounts.length) {
     const empty = document.createElement('div');
@@ -136,26 +167,32 @@ function renderAccounts() {
     card.className = `account-card${isActive ? ' active' : ''}`;
     card.dataset.id = acc.id;
 
-    // Avatar
     const avatar = document.createElement('div');
     avatar.className = 'account-avatar';
     avatar.style.background = avatarColor(acc.username);
     avatar.textContent = getInitial(acc.username);
 
-    // Info block
     const info = document.createElement('div');
     info.className = 'account-info';
 
     const nameEl = document.createElement('div');
     nameEl.className = 'account-name';
-    nameEl.textContent = acc.username; // textContent — безопасно, HTML не интерпретируется
+    nameEl.textContent = acc.username;
 
+    // FIX (проблема #13): если у аккаунта есть отдельно определённый реальный
+    // логин Twitch (twitchLogin), и он отличается от отображаемого имени
+    // (кастомного label), показываем его в подписи — так пользователю видно,
+    // под каким РЕАЛЬНЫМ логином нужно быть в браузере, чтобы кнопка
+    // "обновить сессию" сработала.
+    const metaParts = [`${acc.cookieCount || 0} cookies`, formatDate(acc.capturedAt)];
+    if (acc.twitchLogin && acc.twitchLogin.toLowerCase() !== acc.username.toLowerCase()) {
+      metaParts.push(`логин: ${acc.twitchLogin}`);
+    }
     const metaEl = document.createElement('div');
     metaEl.className = 'account-meta';
-    metaEl.textContent = `${acc.cookieCount || 0} cookies · ${formatDate(acc.capturedAt)}`;
+    metaEl.textContent = metaParts.join(' · ');
 
     info.append(nameEl, metaEl);
-
     card.append(avatar, info);
 
     if (isActive) {
@@ -165,7 +202,6 @@ function renderAccounts() {
       card.appendChild(badge);
     }
 
-    // Actions
     const actions = document.createElement('div');
     actions.className = 'card-actions';
 
@@ -206,39 +242,47 @@ function renderAccounts() {
 
 // ─── Actions ───────────────────────────────────────────────────────────────
 
+// FIX (проблема #16): раньше Promise.all "проваливал" весь loadState при
+// падении ЛЮБОГО одного запроса — UI вообще не обновлялся, даже если второй
+// запрос успешно вернул данные. Теперь Promise.allSettled: каждая часть UI
+// обновляется независимо от того, упал ли соседний запрос.
 async function loadState() {
-  try {
-    const [accsResp, curResp] = await Promise.all([
-      sendMsg({ action: 'loadAccounts' }),
-      sendMsg({ action: 'getCurrentCookieUser' })
-    ]);
-    state.accounts = accsResp.accounts;
-    state.activeAccountId = accsResp.activeAccountId;
-    // FIX #9: currentUser берём строго из cookies (username, извлечённый background.js
-    // через twilight-user JSON / login cookie), а не из label аккаунта.
-    state.currentUser = curResp.username;
-    const loggedIn = curResp.loggedIn;
+  const [accsResult, curResult] = await Promise.allSettled([
+    sendMsg({ action: 'loadAccounts' }),
+    sendMsg({ action: 'getCurrentCookieUser' })
+  ]);
 
-    currentName.textContent = loggedIn ? (curResp.username || 'Неизвестно') : 'Не авторизован';
+  if (accsResult.status === 'fulfilled') {
+    state.accounts = accsResult.value.accounts;
+    state.activeAccountId = accsResult.value.activeAccountId;
+  } else {
+    console.warn('[Twitch Alt Manager] loadAccounts не удался:', accsResult.reason?.message);
+  }
+
+  if (curResult.status === 'fulfilled') {
+    state.currentUser = curResult.value.username;
+    const loggedIn = curResult.value.loggedIn;
+    currentName.textContent = loggedIn ? (curResult.value.username || 'Неизвестно') : 'Не авторизован';
     statusDot.className = `status-dot${loggedIn ? ' online' : ''}`;
     btnCapture.disabled = !loggedIn;
+  } else {
+    console.warn('[Twitch Alt Manager] getCurrentCookieUser не удался:', curResult.reason?.message);
+    currentName.textContent = 'Ошибка';
+    statusDot.className = 'status-dot';
+    btnCapture.disabled = true; // безопасный дефолт, раз не знаем состояние логина
+  }
 
-    footerHint.textContent = state.accounts.length
-      ? 'Кликните по аккаунту для мгновенного переключения'
-      : 'Войдите в Twitch и сохраните сессию';
+  footerHint.textContent = state.accounts.length
+    ? 'Кликните по аккаунту для мгновенного переключения'
+    : 'Войдите в Twitch и сохраните сессию';
 
-    renderAccounts();
-  } catch (e) {
-    showToast('Ошибка загрузки: ' + e.message, 'error');
+  renderAccounts();
+
+  if (accsResult.status === 'rejected' || curResult.status === 'rejected') {
+    showToast('Часть данных не удалось загрузить', 'error');
   }
 }
 
-// FIX #14 (было: окно закрывалось сразу после showToast, без явной гарантии,
-// что состояние (активный аккаунт) уже актуализировано).
-// Теперь: 1) дожидаемся успешного switchAccount от background,
-//         2) обновляем локальное состояние,
-//         3) дожидаемся полного loadState() (перезапрос актуальных данных),
-//         4) только после этого закрываем попап.
 async function switchAccount(accountId, username) {
   showSwitching(username);
   try {
@@ -250,14 +294,17 @@ async function switchAccount(accountId, username) {
 
     state.activeAccountId = accountId;
     renderAccounts();
-
-    // Дожидаемся полного обновления состояния (не просто оптимистичного рендера)
     await loadState();
 
-    showToast(`Переключено: ${username}`, 'success');
+    // FIX (свежий разбор): раньше отказ chrome.tabs.reload() был не виден
+    // пользователю — теперь если ВСЕ вкладки не смогли перезагрузиться,
+    // сообщаем об этом явно вместо обычного "успех".
+    if (resp.totalTabs > 0 && resp.reloadFailures === resp.totalTabs) {
+      showToast(`Аккаунт переключён (${username}), но вкладку не удалось обновить — обнови вручную`, 'error', 4000);
+    } else {
+      showToast(`Переключено: ${username}`, 'success');
+    }
 
-    // FIX #11: задержка увеличена с 800 до 2000мс, чтобы пользователь
-    // гарантированно успел увидеть уведомление об успехе перед закрытием попапа
     setTimeout(() => window.close(), 2000);
   } catch (e) {
     hideSwitching();
@@ -268,7 +315,8 @@ async function switchAccount(accountId, username) {
 async function deleteAccount(accountId) {
   const acc = state.accounts.find(a => a.id === accountId);
   if (!acc) return;
-  if (!confirm(`Удалить аккаунт «${acc.username}»?`)) return;
+  const confirmed = await showConfirm(`Удалить аккаунт «${acc.username}»?`);
+  if (!confirmed) return;
   try {
     await sendMsg({ action: 'deleteAccount', accountId });
     state.accounts = state.accounts.filter(a => a.id !== accountId);
@@ -280,11 +328,12 @@ async function deleteAccount(accountId) {
   }
 }
 
-// FIX #9 (было: сравнение acc.username с state.currentUser могло ложно не совпасть,
-// если label был изменён вручную и отличался от реального логина в cookies).
-// state.currentUser теперь всегда берётся из cookies (см. loadState/FIX #9 выше),
-// а не из label — поэтому сравнение здесь корректно отражает реальный залогиненный
-// в браузере аккаунт, независимо от того, как пользователь назвал сохранённую запись.
+// FIX (проблема #13): сравниваем с реальным логином Twitch (twitchLogin), а
+// не с отображаемым именем (username/label) — иначе кастомное имя вроде
+// "Основной" никогда бы не совпало с реальным логином из cookies, и кнопка
+// обновления сессии была бы вечно заблокирована. Для аккаунтов, сохранённых
+// до этого исправления (без поля twitchLogin), используем username как
+// раньше — чтобы не сломать уже существующие записи.
 async function refreshAccount(accountId) {
   const acc = state.accounts.find(a => a.id === accountId);
   if (!acc) return;
@@ -294,8 +343,10 @@ async function refreshAccount(accountId) {
     return;
   }
 
-  if (acc.username.toLowerCase() !== state.currentUser.toLowerCase()) {
-    showToast(`Сначала войдите как ${acc.username} (сейчас: ${state.currentUser})`, 'error', 3500);
+  const identity = acc.twitchLogin || acc.username;
+
+  if (identity.toLowerCase() !== state.currentUser.toLowerCase()) {
+    showToast(`Сначала войди как ${identity} (сейчас: ${state.currentUser})`, 'error', 3500);
     return;
   }
 
@@ -342,10 +393,6 @@ btnConfirm.addEventListener('click', async () => {
 
 labelInput.addEventListener('keydown', e => {
   if (e.key === 'Enter') {
-    // FIX #12: preventDefault останавливает возможную нативную отправку формы,
-    // а проверка !btnConfirm.disabled не даёт запустить повторный сабмит,
-    // пока предыдущий запрос captureAccount ещё выполняется (кнопка временно
-    // задизейблена в btnConfirm.addEventListener выше).
     e.preventDefault();
     if (!btnConfirm.disabled) btnConfirm.click();
   }
