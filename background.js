@@ -1,6 +1,6 @@
 // background.js — Service Worker for Twitch Alt Manager
 //
-// ВАЖНО О БЕЗОПАСНОСТИ (см. README "Модель угроз"):
+// ВАЖНО О БЕЗОПАСНОСТИ (модель угроз):
 // Ключ шифрования хранится как non-extractable CryptoKey в IndexedDB.
 // Это значит, что сами байты ключа НЕЛЬЗЯ прочитать даже кодом расширения —
 // только использовать через crypto.subtle.encrypt/decrypt. Это существенно
@@ -76,14 +76,15 @@ async function migrateLegacyKeyIfNeeded() {
 // больше не дойдёт до миграции/очистки. Это не потеря данных (как описано в
 // ревью), а обратная и более серьёзная проблема — утечка ключа. Подчищаем
 // такой хвост при каждом "быстром" пути, когда ключ уже есть в IndexedDB.
-function cleanupLegacyKeyBytesIfPresent() {
-  chrome.storage.local.get('_enc_key').then(stored => {
-    if (stored._enc_key) {
-      chrome.storage.local.remove('_enc_key')
-        .then(() => console.info('[Twitch Alt Manager] Удалены остаточные незашифрованные байты старого ключа.'))
-        .catch(() => {});
-    }
-  }).catch(() => {});
+async function cleanupLegacyKeyBytesIfPresent() {
+  try {
+    const stored = await chrome.storage.local.get('_enc_key');
+    if (!stored._enc_key) return;
+    await chrome.storage.local.remove('_enc_key');
+    console.info('[Twitch Alt Manager] Удалены остаточные незашифрованные байты старого ключа.');
+  } catch (e) {
+    console.warn('[Twitch Alt Manager] Не удалось удалить остаточные байты старого ключа:', e.message || e);
+  }
 }
 
 let cachedKeyPromise = null;
@@ -94,7 +95,7 @@ async function getEncryptionKey() {
   cachedKeyPromise = (async () => {
     let key = await idbGetKey();
     if (key) {
-      cleanupLegacyKeyBytesIfPresent(); // не блокирующий best-effort вызов
+      await cleanupLegacyKeyBytesIfPresent();
       return key;
     }
 
@@ -262,9 +263,35 @@ async function setCookies(cookieList) {
 
 // ─── Account storage ──────────────────────────────────────────────────────────
 
+function isValidEncryptedCookies(value) {
+  return !!value &&
+    typeof value === 'object' &&
+    Array.isArray(value.iv) && value.iv.length === 12 &&
+    value.iv.every(n => Number.isInteger(n) && n >= 0 && n <= 255) &&
+    Array.isArray(value.data) && value.data.length > 0 &&
+    value.data.every(n => Number.isInteger(n) && n >= 0 && n <= 255);
+}
+
+function isValidStoredAccount(account) {
+  if (!account || typeof account !== 'object') return false;
+  if (typeof account.id !== 'string' || !account.id.trim()) return false;
+  if (typeof account.username !== 'string' || !account.username.trim()) return false;
+  if (!isValidEncryptedCookies(account.encryptedCookies)) return false;
+  if (!Number.isFinite(account.capturedAt)) return false;
+  if (!Number.isInteger(account.cookieCount) || account.cookieCount < 0) return false;
+  if (account.twitchLogin !== null && account.twitchLogin !== undefined && typeof account.twitchLogin !== 'string') return false;
+  return true;
+}
+
 async function loadAccounts() {
   const { accounts } = await chrome.storage.local.get('accounts');
-  return accounts || [];
+  if (!Array.isArray(accounts)) return [];
+
+  const valid = accounts.filter(isValidStoredAccount);
+  if (valid.length !== accounts.length) {
+    console.warn(`[Twitch Alt Manager] Отфильтровано повреждённых записей аккаунтов: ${accounts.length - valid.length}`);
+  }
+  return valid;
 }
 
 // FIX (проблема #19): более понятное сообщение при переполнении хранилища,
@@ -295,7 +322,7 @@ const MAX_ACCOUNT_PAYLOAD_BYTES = 500 * 1024; // 500 КБ на аккаунт ц
 
 async function captureStorageFromActiveTab() {
   const activeTabs = await chrome.tabs.query({
-    url: ['*://*.twitch.tv/*'],
+    url: ['*://twitch.tv/*', '*://*.twitch.tv/*'],
     active: true,
     currentWindow: true
   });
@@ -437,13 +464,13 @@ async function captureCurrentAccount(label) {
   return account;
 }
 
-// FIX (проблема #15): таймаут поднят до 3000мс (внутренний таймаут очистки
+// FIX (проблема #15): таймаут поднят до 5000мс (внутренний таймаут очистки
 // IndexedDB в content.js — 1500мс на 4 базы параллельно, т.е. ~1500мс худший
 // случай; старые 2000мс снаружи оставляли только ~500мс запаса на само
 // сообщение и цикл по localStorage — маловато). Плюс теперь логируем, какие
 // именно вкладки не подтвердили очистку вовремя.
-async function sendToAllTwitchTabsAndWait(msg, timeoutMs = 3000) {
-  const tabs = await chrome.tabs.query({ url: ['*://*.twitch.tv/*'] });
+async function sendToAllTwitchTabsAndWait(msg, timeoutMs = 5000) {
+  const tabs = await chrome.tabs.query({ url: ['*://twitch.tv/*', '*://*.twitch.tv/*'] });
   if (!tabs.length) return { tabs: [], acked: 0 };
 
   const withTimeout = (promise, ms) => Promise.race([
@@ -505,7 +532,7 @@ async function switchToAccount(accountId) {
   // старая уже стёрта, новая не встала.
   const previousCookiesSnapshot = await getAllTwitchCookies();
 
-  await sendToAllTwitchTabsAndWait({ action: 'clearLocalStorage' }, 3000);
+  await sendToAllTwitchTabsAndWait({ action: 'clearLocalStorage' }, 5000);
 
   const clearResult = await clearTwitchCookies();
   if (clearResult.failedDetails.length) {
@@ -559,18 +586,25 @@ async function switchToAccount(accountId) {
     );
   }
 
-  await chrome.storage.local.set({ activeAccountId: accountId });
+  try {
+    await chrome.storage.local.set({ activeAccountId: accountId });
+  } catch (e) {
+    console.warn('[Twitch Alt Manager] Не удалось сохранить activeAccountId после переключения:', e.message || e);
+  }
 
   const hasLocal = localStorageData && Object.keys(localStorageData).length > 0;
   const hasSession = sessionStorageData && Object.keys(sessionStorageData).length > 0;
 
   if (hasLocal || hasSession) {
+    const twitchTabs = await chrome.tabs.query({ url: ['*://twitch.tv/*', '*://*.twitch.tv/*'] });
     await chrome.storage.local.set({
       pendingStorageData: {
         accountId,
         localStorageData: hasLocal ? localStorageData : {},
         sessionStorageData: hasSession ? sessionStorageData : {},
-        createdAt: Date.now()
+        tabIds: twitchTabs.map(tab => tab.id).filter(Number.isInteger),
+        createdAt: Date.now(),
+        expiresAt: Date.now() + 60_000
       }
     });
   } else {
@@ -636,7 +670,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           // FIX (свежий разбор): раньше ошибки chrome.tabs.reload() тихо
           // проглатывались (catch(_){}), и popup всегда получал "успех", даже
           // если ВСЕ перезагрузки вкладок провалились.
-          const tabs = await chrome.tabs.query({ url: ['*://*.twitch.tv/*'] });
+          const tabs = await chrome.tabs.query({ url: ['*://twitch.tv/*', '*://*.twitch.tv/*'] });
           let reloadFailures = 0;
           for (const tab of tabs) {
             try {
@@ -677,6 +711,54 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           sendResponse({ ok: true, username, loggedIn: !!authToken });
           break;
         }
+        case 'getEncryptionKeyStatus': {
+          let available = false;
+          let checkFailed = false;
+          try {
+            available = !!(await idbGetKey());
+            if (!available) {
+              const stored = await chrome.storage.local.get('_enc_key');
+              available = !!stored._enc_key;
+            }
+          } catch (e) {
+            checkFailed = true;
+            console.warn('[Twitch Alt Manager] Не удалось проверить наличие ключа шифрования:', e.message || e);
+          }
+          sendResponse({ ok: true, available, checkFailed });
+          break;
+        }
+        case 'storageRestored': {
+          const { pendingStorageData, activeAccountId } = await chrome.storage.local.get(['pendingStorageData', 'activeAccountId']);
+          const tabId = sender.tab?.id;
+          if (!pendingStorageData || !Number.isInteger(tabId)) {
+            sendResponse({ ok: true });
+            break;
+          }
+          if (pendingStorageData.expiresAt && pendingStorageData.expiresAt < Date.now()) {
+            await chrome.storage.local.remove('pendingStorageData');
+            sendResponse({ ok: true });
+            break;
+          }
+          if (pendingStorageData.accountId !== activeAccountId) {
+            sendResponse({ ok: true });
+            break;
+          }
+          const remaining = Array.isArray(pendingStorageData.tabIds)
+            ? pendingStorageData.tabIds.filter(id => id !== tabId)
+            : [];
+          if (remaining.length === 0) {
+            await chrome.storage.local.remove('pendingStorageData');
+          } else {
+            await chrome.storage.local.set({ pendingStorageData: { ...pendingStorageData, tabIds: remaining } });
+          }
+          sendResponse({ ok: true });
+          break;
+        }
+        case 'isStoredAccount': {
+          const accounts = await loadAccounts();
+          sendResponse({ ok: true, exists: accounts.some(a => a.id === msg.accountId) });
+          break;
+        }
         case 'refreshAccount': {
           const accs = await loadAccounts();
           const existing = accs.find(a => a.id === msg.accountId);
@@ -702,3 +784,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   return true; // async response
 });
+
+
+// Экспорт только для unit-тестов Node/Jest; в обычной работе расширения module отсутствует.
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = {
+    computeExpirationDate,
+    cookieUrl,
+    isValidEncryptedCookies,
+    isValidStoredAccount,
+    loadAccounts,
+    setCookies,
+    encrypt,
+    decrypt,
+    getEncryptionKey,
+    cleanupLegacyKeyBytesIfPresent
+  };
+}

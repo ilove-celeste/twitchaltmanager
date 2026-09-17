@@ -18,32 +18,50 @@
       const { pendingStorageData, activeAccountId } = result;
       if (!pendingStorageData) return;
 
-      if (pendingStorageData.accountId !== activeAccountId) {
-        console.warn('[Twitch Alt Manager] pendingStorageData принадлежит другому аккаунту — пропускаем восстановление.');
+      if (!pendingStorageData.accountId || !activeAccountId || pendingStorageData.accountId !== activeAccountId) {
+        console.warn('[Twitch Alt Manager] pendingStorageData не привязан к активному аккаунту — пропускаем восстановление.');
         return;
       }
 
-      try {
-        const localData = pendingStorageData.localStorageData || {};
-        for (const [key, value] of Object.entries(localData)) {
-          try { localStorage.setItem(key, value); } catch (e) {
-            console.warn(`[Twitch Alt Manager] Не удалось восстановить localStorage ключ "${key}":`, e.message);
-          }
+      const expiresAt = Number(pendingStorageData.expiresAt || 0);
+      if (expiresAt && expiresAt < Date.now()) {
+        chrome.storage.local.remove('pendingStorageData');
+        return;
+      }
+
+      chrome.runtime.sendMessage({ action: 'isStoredAccount', accountId: pendingStorageData.accountId }, (accountCheck) => {
+        if (chrome.runtime.lastError) {
+          console.warn('[Twitch Alt Manager] Не удалось проверить существование аккаунта:', chrome.runtime.lastError.message);
+          return;
+        }
+        if (!accountCheck?.ok || !accountCheck.exists) {
+          console.warn('[Twitch Alt Manager] Аккаунт для pendingStorageData больше не существует — пропускаем восстановление.');
+          return;
         }
 
-        const sessionData = pendingStorageData.sessionStorageData || {};
-        for (const [key, value] of Object.entries(sessionData)) {
-          try { sessionStorage.setItem(key, value); } catch (e) {
-            console.warn(`[Twitch Alt Manager] Не удалось восстановить sessionStorage ключ "${key}":`, e.message);
+        try {
+          const localData = pendingStorageData.localStorageData || {};
+          for (const [key, value] of Object.entries(localData)) {
+            try { localStorage.setItem(key, value); } catch (e) {
+              console.warn(`[Twitch Alt Manager] Не удалось восстановить localStorage ключ "${key}":`, e.message);
+            }
           }
+
+          const sessionData = pendingStorageData.sessionStorageData || {};
+          for (const [key, value] of Object.entries(sessionData)) {
+            try { sessionStorage.setItem(key, value); } catch (e) {
+              console.warn(`[Twitch Alt Manager] Не удалось восстановить sessionStorage ключ "${key}":`, e.message);
+            }
+          }
+          chrome.runtime.sendMessage({ action: 'storageRestored' }, () => {
+            if (chrome.runtime.lastError) {
+              console.warn('[Twitch Alt Manager] Ошибка подтверждения восстановления storage:', chrome.runtime.lastError.message);
+            }
+          });
+        } catch (e) {
+          console.warn('[Twitch Alt Manager] Ошибка восстановления storage:', e.message || e);
         }
-      } finally {
-        chrome.storage.local.remove('pendingStorageData', () => {
-          if (chrome.runtime.lastError) {
-            console.warn('[Twitch Alt Manager] Ошибка удаления pendingStorageData:', chrome.runtime.lastError.message);
-          }
-        });
-      }
+      });
     });
   }
 
@@ -54,10 +72,6 @@
         .then(() => sendResponse({ ok: true }))
         .catch(e => sendResponse({ ok: false, error: e.message }));
       return true; // async response
-    }
-    if (msg.action === 'pageReady') {
-      sendResponse({ ok: true });
-      return true;
     }
   });
 
@@ -131,9 +145,5 @@
 
     return results;
   }
-
-  try {
-    chrome.runtime.sendMessage({ action: 'pageReady', url: location.href });
-  } catch (_) {}
 
 })();

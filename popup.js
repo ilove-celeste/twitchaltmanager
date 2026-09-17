@@ -280,6 +280,17 @@ async function loadState() {
 
   if (accsResult.status === 'rejected' || curResult.status === 'rejected') {
     showToast('Часть данных не удалось загрузить', 'error');
+  } else if (state.accounts.length) {
+    try {
+      const keyStatus = await sendMsg({ action: 'getEncryptionKeyStatus' });
+      if (keyStatus.checkFailed) {
+        showToast('Не удалось проверить ключ шифрования. Попробуй открыть панель ещё раз.', 'error', 5000);
+      } else if (!keyStatus.available) {
+        showToast('Ключ шифрования не найден. Сохранённые аккаунты не удастся расшифровать — пересохрани их.', 'error', 6000);
+      }
+    } catch (e) {
+      console.warn('[Twitch Alt Manager] Не удалось проверить ключ шифрования:', e.message);
+    }
   }
 }
 
@@ -296,11 +307,10 @@ async function switchAccount(accountId, username) {
     renderAccounts();
     await loadState();
 
-    // FIX (свежий разбор): раньше отказ chrome.tabs.reload() был не виден
-    // пользователю — теперь если ВСЕ вкладки не смогли перезагрузиться,
-    // сообщаем об этом явно вместо обычного "успех".
-    if (resp.totalTabs > 0 && resp.reloadFailures === resp.totalTabs) {
-      showToast(`Аккаунт переключён (${username}), но вкладку не удалось обновить — обнови вручную`, 'error', 4000);
+    // FIX (свежий разбор): теперь любое количество неудачных reload видимо
+    // пользователю, а не только случай, когда не обновилась ни одна вкладка.
+    if (resp.reloadFailures > 0) {
+      showToast(`Аккаунт переключён: ${username}, но ${resp.reloadFailures} из ${resp.totalTabs} вкладок не удалось обновить`, 'error', 5000);
     } else {
       showToast(`Переключено: ${username}`, 'success');
     }
@@ -361,13 +371,15 @@ async function refreshAccount(accountId) {
 
 // ─── Capture flow ──────────────────────────────────────────────────────────
 
-btnCapture.addEventListener('click', () => {
+btnCapture.addEventListener('click', async () => {
   addPanel.classList.toggle('open');
-  if (addPanel.classList.contains('open')) {
-    labelInput.value = state.currentUser || '';
-    labelInput.focus();
-    labelInput.select();
-  }
+  if (!addPanel.classList.contains('open')) return;
+
+  await loadState();
+  if (!addPanel.classList.contains('open')) return;
+  labelInput.value = state.currentUser || '';
+  labelInput.focus();
+  labelInput.select();
 });
 
 btnConfirm.addEventListener('click', async () => {
